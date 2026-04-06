@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: bash /oraprd/oracle_patching_script/03_start_db_services.sh [state_file]
+
+STATE_FILE="${1:-/oraprd/oracle_patching_script/patch_state.env}"
+source "$STATE_FILE"
+source /oraprd/oracle_patching_script/scripts/common.sh
+
+init_logging_dirs
+log_message "=== Start Phase: starting on host $(hostname) ==="
+
+require_var ORACLE_HOME
+require_var LOGDIR
+require_cmd tee awk grep sqlplus lsnrctl
+
+# --- Pre-flight normalization (optional but robust) ---
+# Strip CRLF and HTML entities in-place if they snuck in via copy/paste
+this_script="$(readlink -f "$0")"
+sed -i 's/\r$//' "$this_script"
+sed -i -e 's/&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;&amp;/&&/g' -e 's/</</g' -e 's/>/>/g' "$this_script"
+
+# --- Select awk binary ---
+AWK_BIN="$(command -v gawk || command -v awk)"
+require_cmd "$AWK_BIN"
+
+# --- GG helpers ---
+GG_HOME="${GG_HOME:-}"
+
+gg_info_all_snapshot() {
+  local info_log="$LOGDIR/ggsci_info_all_$(hostname)_$(date +%F_%H%M%S).log"
+  "$GG_HOME/ggsci" >"$info_log" 2>>"$MASTER_LOG" <<'EOI'
+info all
+exit
+EOI
+  cat "$info_log"
+}
+
+ensure_gg_start_parser() {
+  GG_START_AWK="${LOGDIR}/parse_info_all_start.awk"
+  cat >"$GG_START_AWK" <<'AWK'
+BEGIN { wr=0; mgr="UNKNOWN" }
+NF < 2 { next }
+{
+  prog=$1; stat=$2
+}
+# Manager line
+(prog == "MANAGER") { mgr = toupper(stat); next }
+# Count RUNNING workers (adjust the set if needed)
+(prog ~ /^(EXTRACT|REPLICAT|DATAPUMP|PEER|SERVER)$/ && toupper(stat)=="RUNNING") { wr++ }
+END { print wr, mgr }
+AWK
+  # normalize any accidental CR
+  sed -i 's/\r$//' "$GG_START_AWK"
+}
+
+# ------------------------------------------------------------------------------
+# 1) Start listener
+# ------------------------------------------------------------------------------
+log_message "Starting Oracle Listener"
+if "$ORACLE_HOME/bin/lsnrctl" start >>"$MASTER_LOG" 2>&1; then
+  log_message "Listener start succeeded"
+else
+  log_message "Listener start returned non-zero" # continuing
+fi
+
+# ------------------------------------------------------------------------------
+# 2) Start Oracle DB instances via /etc/oratab
+# ------------------------------------------------------------------------------
+log_message "Starting DB instances from /etc/oratab"
+if [[ -f /etc/oratab ]]; then
+  while IFS=: read -r ORATAB_SID ORATAB_HOME ORATAB_FLAG; do
+    [[ -z "$ORATAB_SID" || "$ORATAB_SID" =~ ^# ]] && continue
+    [[ "$ORATAB_HOME" != "$ORACLE_HOME" ]] && continue
+    [[ ! "$ORATAB_FLAG" =~ ^Y ]] && continue
+    log_message "Starting instance: $ORATAB_SID"
+    export ORACLE_SID="$ORATAB_SID"
+    "$ORACLE_HOME/bin/sqlplus" -s / as sysdba >>"$MASTER_LOG" 2>&1 <<'EOF'
+startup;
+exit;
+EOF
+  done < /etc/oratab
+else
+  log_message "/etc/oratab not found; cannot auto-start instances"; exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# 3) Restart GoldenGate (if present)
+# ------------------------------------------------------------------------------
+if [[ -d "${GG_HOME}" && -x "$GG_HOME/ggsci" ]]; then
+  log_message "Restarting GoldenGate services from $GG_HOME"
+
+  # Start Manager
+  "$GG_HOME/ggsci" >>"$MASTER_LOG" 2>&1 <<'EOF'
+start mgr
+exit
+EOF
+  log_message "GoldenGate Manager start command issued"
+
+  # Start all workers (optional; keep if desired)
+  "$GG_HOME/ggsci" >>"$MASTER_LOG" 2>&1 <<'EOF'
+start *
+exit
+EOF
+  log_message "GoldenGate workers start command issued; verifying status..."
+
+  # Verification loop with settle wait
+  SETTLE_WAIT_SECONDS="${SETTLE_WAIT_SECONDS:-15}"
+  POLL_INTERVAL="${POLL_INTERVAL:-5}"
+  TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-300}"
+
+  sleep "$SETTLE_WAIT_SECONDS"
+
+  ensure_gg_start_parser
+  end=$(( $(date +%s) + TIMEOUT_SECONDS ))
+
+  while true; do
+    out="$(gg_info_all_snapshot)"
+    echo "$out" >>"$MASTER_LOG"
+
+    # Flag ABENDED/DEAD states for visibility
+    if echo "$out" | grep -Eiq '^(EXTRACT|REPLICAT|DATAPUMP|PEER|SERVER)[[:space:]]+(ABENDED|DEAD)'; then
+      log_message "Warning: Detected ABENDED/DEAD processes after start—manual review may be required."
+    fi
+
+    # Parse Manager/workers from file-based awk (immune to quoting/encoding issues)
+    read -r workers_running manager_status <<<"$(echo "$out" | LC_ALL=C "$AWK_BIN" -f "$GG_START_AWK")"
+    [[ -z "$workers_running" ]] && workers_running=0
+    [[ -z "$manager_status" ]] && manager_status="UNKNOWN"
+
+    log_message "Snapshot: workers_running=${workers_running}, manager_status=${manager_status}"
+
+    # Success criteria: Manager RUNNING; require >=1 worker RUNNING (tune if needed)
+    if [[ "$manager_status" == "RUNNING" && "$workers_running" -ge 1 ]]; then
+      log_message "GoldenGate services are fully running."
+      break
+    fi
+
+    if (( $(date +%s) >= end )); then
+      log_message "Timeout reached while waiting for GoldenGate services to start."
+      exit 1
+    fi
+
+    sleep "$POLL_INTERVAL"
+  done
+else
+  log_message "GoldenGate home not found or ggsci not executable; skipping GG start"
+fi
+
+log_message "=== Start Phase: completed ==="
+
